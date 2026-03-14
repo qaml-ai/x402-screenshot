@@ -1,71 +1,68 @@
 import { Hono } from "hono";
 import { cdpPaymentMiddleware } from "x402-cdp";
-import { describeRoute, openAPIRouteHandler } from "hono-openapi";
+import { extractParams } from "x402-ai";
+import { openapiFromMiddleware } from "x402-openapi";
 import puppeteer from "@cloudflare/puppeteer";
 
 const app = new Hono<{ Bindings: Env }>();
 
-app.get("/.well-known/openapi.json", openAPIRouteHandler(app, {
-  documentation: {
-    info: {
-      title: "x402 Screenshot Service",
-      description: "Capture screenshots of any URL as PNG or PDF. Pay-per-use via x402 protocol on Base mainnet.",
-      version: "1.0.0",
-    },
-    servers: [{ url: "https://screenshot.camelai.io" }],
-  },
-}));
+const SYSTEM_PROMPT = `You are a parameter extractor for a screenshot capture service.
+Extract the following from the user's message and return JSON:
+- "url": the URL to screenshot (required)
+- "format": "png" or "pdf", default "png" (optional)
 
-app.use(
-  cdpPaymentMiddleware(
-    (env) => ({
-      "GET /screenshot": {
-        accepts: [
-          {
-            scheme: "exact",
-            price: "$0.01",
-            network: "eip155:8453",
-            payTo: env.SERVER_ADDRESS as `0x${string}`,
+Return ONLY valid JSON, no explanation.
+Examples:
+- {"url": "https://example.com"}
+- {"url": "https://example.com", "format": "pdf"}`;
+
+const ROUTES = {
+  "POST /": {
+    accepts: [{ scheme: "exact", price: "$0.01", network: "eip155:8453", payTo: "0x0" as `0x${string}` }],
+    description: "Capture a screenshot of any URL. Send {\"input\": \"your request\"}",
+    mimeType: "image/png",
+    extensions: {
+      bazaar: {
+        info: {
+          input: {
+            type: "http",
+            method: "POST",
+            bodyType: "json",
+            body: {
+              input: { type: "string", description: "Describe the URL to screenshot and optional format (png or pdf)", required: true },
+            },
           },
-        ],
-        description: "Capture a screenshot of any URL",
-        mimeType: "image/png",
-        extensions: {
-          bazaar: {
-            discoverable: true,
-            inputSchema: {
-              queryParams: {
-                url: {
-                  type: "string",
-                  description: "URL to screenshot",
-                  required: true,
-                },
-                format: {
-                  type: "string",
-                  description: "png or pdf",
-                  required: false,
-                },
-              },
+          output: { type: "raw" },
+        },
+        schema: {
+          properties: {
+            input: {
+              properties: { method: { type: "string", enum: ["POST"] } },
+              required: ["method"],
             },
           },
         },
       },
-    })
-  )
+    },
+  },
+};
+
+app.use(
+  cdpPaymentMiddleware((env) => ({
+    "POST /": { ...ROUTES["POST /"], accepts: [{ ...ROUTES["POST /"].accepts[0], payTo: env.SERVER_ADDRESS as `0x${string}` }] },
+  }))
 );
 
-app.get("/screenshot", describeRoute({
-  description: "Capture a screenshot of any URL. Returns PNG or PDF. Requires x402 payment ($0.01).",
-  responses: {
-    200: { description: "Screenshot image or PDF", content: { "image/png": { schema: { type: "string", format: "binary" } }, "application/pdf": { schema: { type: "string", format: "binary" } } } },
-    400: { description: "Invalid or missing URL" },
-    402: { description: "Payment required" },
-    500: { description: "Screenshot failed" },
-  },
-}), async (c) => {
-  const url = c.req.query("url");
+app.post("/", async (c) => {
+  const body = await c.req.json<{ input?: string }>();
+  if (!body?.input) {
+    return c.json({ error: "Missing 'input' field" }, 400);
+  }
+
+  const params = await extractParams(c.env.CF_GATEWAY_TOKEN, SYSTEM_PROMPT, body.input);
+  const url = params.url as string;
   if (!url) {
-    return c.json({ error: "Missing required query parameter: url" }, 400);
+    return c.json({ error: "Could not determine URL to screenshot" }, 400);
   }
 
   // Validate URL
@@ -75,7 +72,7 @@ app.get("/screenshot", describeRoute({
     return c.json({ error: "Invalid URL" }, 400);
   }
 
-  const format = (c.req.query("format") || "png").toLowerCase();
+  const format = ((params.format as string) || "png").toLowerCase();
   if (format !== "png" && format !== "pdf") {
     return c.json({ error: "Format must be png or pdf" }, 400);
   }
@@ -112,6 +109,16 @@ app.get("/screenshot", describeRoute({
       await browser.close();
     }
   }
+});
+
+app.get("/.well-known/openapi.json", openapiFromMiddleware("x402 Screenshot", "screenshot.camelai.io", ROUTES));
+
+app.get("/", (c) => {
+  return c.json({
+    service: "x402-screenshot",
+    description: "Capture screenshots of any URL as PNG or PDF. Send POST / with {\"input\": \"screenshot https://example.com\"}",
+    price: "$0.01 per request (Base mainnet)",
+  });
 });
 
 export default app;
