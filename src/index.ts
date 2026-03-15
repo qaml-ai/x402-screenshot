@@ -1,26 +1,19 @@
 import { Hono } from "hono";
 import { cdpPaymentMiddleware } from "x402-cdp";
 import { stripeApiKeyMiddleware } from "x402-stripe";
-import { extractParams } from "x402-ai";
 import { openapiFromMiddleware } from "x402-openapi";
 import puppeteer from "@cloudflare/puppeteer";
 
 const app = new Hono<{ Bindings: Env }>();
 
-const SYSTEM_PROMPT = `You are a parameter extractor for a screenshot capture service.
-Extract the following from the user's message and return JSON:
-- "url": the URL to screenshot (required)
-- "format": "png" or "pdf", default "png" (optional)
-
-Return ONLY valid JSON, no explanation.
-Examples:
-- {"url": "https://example.com"}
-- {"url": "https://example.com", "format": "pdf"}`;
-
 const ROUTES = {
   "POST /": {
-    accepts: [{ scheme: "exact", price: "$0.01", network: "eip155:8453", payTo: "0x0" as `0x${string}` }],
-    description: "Capture a screenshot of any URL. Send {\"input\": \"your request\"}",
+    accepts: [
+      { scheme: "exact", price: "$0.01", network: "eip155:8453", payTo: "0x0" as `0x${string}` },
+      { scheme: "exact", price: "$0.01", network: "eip155:137", payTo: "0x0" as `0x${string}` },
+      { scheme: "exact", price: "$0.01", network: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp", payTo: "CvraJ4avKPpJNLvMhMH5ip2ihdt85PXvDwfzXdziUxRq" },
+    ],
+    description: "Capture a screenshot of any URL. Send {\"url\": \"https://example.com\"}",
     mimeType: "image/png",
     extensions: {
       bazaar: {
@@ -30,7 +23,8 @@ const ROUTES = {
             method: "POST",
             bodyType: "json",
             body: {
-              input: { type: "string", description: "Describe the URL to screenshot and optional format (png or pdf)", required: true },
+              url: { type: "string", description: "The URL to screenshot", required: true },
+              format: { type: "string", description: "Output format: png (default) or pdf", required: false },
             },
           },
           output: { type: "raw" },
@@ -53,30 +47,24 @@ app.use(stripeApiKeyMiddleware({ serviceName: "screenshot" }));
 app.use(async (c, next) => {
   if (c.get("skipX402")) return next();
   return cdpPaymentMiddleware((env) => ({
-    "POST /": { ...ROUTES["POST /"], accepts: [{ ...ROUTES["POST /"].accepts[0], payTo: env.SERVER_ADDRESS as `0x${string}` }] },
+    "POST /": { ...ROUTES["POST /"], accepts: ROUTES["POST /"].accepts.map((a: any) => ({ ...a, payTo: a.network.startsWith("solana") ? a.payTo : env.SERVER_ADDRESS as `0x${string}` })) },
   }))(c, next);
 });
 
 app.post("/", async (c) => {
-  const body = await c.req.json<{ input?: string }>();
-  if (!body?.input) {
-    return c.json({ error: "Missing 'input' field" }, 400);
+  const body = await c.req.json<{ url?: string; format?: string }>();
+  if (!body?.url) {
+    return c.json({ error: "Missing 'url' field" }, 400);
   }
+  const url = body.url.trim();
 
-  const params = await extractParams(c.env.CF_GATEWAY_TOKEN, SYSTEM_PROMPT, body.input);
-  const url = params.url as string;
-  if (!url) {
-    return c.json({ error: "Could not determine URL to screenshot" }, 400);
-  }
-
-  // Validate URL
   try {
     new URL(url);
   } catch {
     return c.json({ error: "Invalid URL" }, 400);
   }
 
-  const format = ((params.format as string) || "png").toLowerCase();
+  const format = (body.format || "png").toLowerCase();
   if (format !== "png" && format !== "pdf") {
     return c.json({ error: "Format must be png or pdf" }, 400);
   }
@@ -120,7 +108,7 @@ app.get("/.well-known/openapi.json", openapiFromMiddleware("x402 Screenshot", "s
 app.get("/", (c) => {
   return c.json({
     service: "x402-screenshot",
-    description: "Capture screenshots of any URL as PNG or PDF. Send POST / with {\"input\": \"screenshot https://example.com\"}",
+    description: "Capture screenshots of any URL as PNG or PDF. Send POST / with {\"url\": \"https://example.com\", \"format\": \"png\"}",
     price: "$0.01 per request (Base mainnet)",
   });
 });
